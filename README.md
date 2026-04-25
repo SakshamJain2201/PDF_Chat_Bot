@@ -70,13 +70,12 @@ OpenAI `gpt-4o-mini` through a conversational retrieval chain.
    chat-with-pdf/app.py
    ```
 
-4. In Streamlit Cloud app settings, add a secret:
+4. In **Advanced settings**, select Python `3.12`.
 
-   ```toml
-   OPENAI_API_KEY = "sk-your-openai-api-key-here"
-   ```
+5. Leave the **Secrets** field empty if users should provide their own OpenAI
+   API key in the sidebar.
 
-5. Deploy. Streamlit Cloud installs `requirements.txt` automatically.
+6. Deploy. Streamlit Cloud installs `requirements.txt` automatically.
 
 ## Notes
 
