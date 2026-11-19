@@ -21,6 +21,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from openai import APIConnectionError, APIError, AuthenticationError, RateLimitError
 
 
 load_dotenv()
@@ -32,6 +33,10 @@ CHUNK_OVERLAP = 100
 RETRIEVER_K = 5
 EMBEDDING_MODEL = "text-embedding-ada-002"
 CHAT_MODEL = "gpt-4o-mini"
+MAX_PDF_COUNT = 5
+MAX_FILE_SIZE_MB = 25
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+MAX_TOTAL_CHUNKS = 1500
 
 st.set_page_config(
     page_title=APP_TITLE,
@@ -56,14 +61,25 @@ Answer:"""
 
 
 # ---------------------------------------------------------------------------
-# Cached model resources
+# Session-scoped OpenAI resources
 # ---------------------------------------------------------------------------
 
 
-@st.cache_resource(show_spinner=False)
 def get_embeddings(api_key: str) -> OpenAIEmbeddings:
-    """Initialize and cache the OpenAI embeddings model."""
-    return OpenAIEmbeddings(model=EMBEDDING_MODEL, openai_api_key=api_key)
+    """Return an embeddings client scoped to the current Streamlit session."""
+    key_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+    if (
+        st.session_state.get("embeddings") is None
+        or st.session_state.get("embeddings_key_fingerprint") != key_fingerprint
+    ):
+        st.session_state.embeddings = OpenAIEmbeddings(
+            model=EMBEDDING_MODEL,
+            openai_api_key=api_key,
+        )
+        st.session_state.embeddings_key_fingerprint = key_fingerprint
+
+    return st.session_state.embeddings
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +98,8 @@ def initialize_session_state() -> None:
         "chat_history": [],
         "total_chunks": 0,
         "uploader_key": 0,
+        "embeddings": None,
+        "embeddings_key_fingerprint": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -103,6 +121,8 @@ def reset_all() -> None:
     st.session_state.chat_history = []
     st.session_state.total_chunks = 0
     st.session_state.uploader_key += 1
+    st.session_state.embeddings = None
+    st.session_state.embeddings_key_fingerprint = None
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +162,11 @@ def get_openai_api_key(sidebar_key: Optional[str]) -> Optional[str]:
         except Exception:
             secret_key = None
 
-    return clean_key(secret_key) or clean_key(os.getenv("OPENAI_API_KEY")) or clean_key(sidebar_key)
+    return (
+        clean_key(secret_key)
+        or clean_key(os.getenv("OPENAI_API_KEY"))
+        or clean_key(sidebar_key)
+    )
 
 
 def get_file_id(file_name: str, file_bytes: bytes) -> str:
@@ -192,31 +216,37 @@ def split_documents(documents: list[Document]) -> list[Document]:
     return chunks
 
 
+def update_total_chunks() -> None:
+    """Synchronize the displayed chunk count with successfully indexed files."""
+    st.session_state.total_chunks = sum(
+        len(file_record["chunks"])
+        for file_record in st.session_state.indexed_files.values()
+    )
+
+
 def rebuild_vector_store(api_key: str) -> None:
     """Rebuild the FAISS index from all currently indexed document chunks."""
     all_chunks: list[Document] = []
     for file_record in st.session_state.indexed_files.values():
         all_chunks.extend(file_record["chunks"])
 
-    st.session_state.total_chunks = len(all_chunks)
     st.session_state.chain = None
     st.session_state.chain_signature = None
 
     if not all_chunks:
         st.session_state.vector_store = None
+        st.session_state.total_chunks = 0
         return
 
     embeddings = get_embeddings(api_key)
-    st.session_state.vector_store = FAISS.from_documents(all_chunks, embeddings)
+    rebuilt_store = FAISS.from_documents(all_chunks, embeddings)
+    st.session_state.vector_store = rebuilt_store
+    st.session_state.total_chunks = len(all_chunks)
 
 
 def add_chunks_to_vector_store(chunks: list[Document], api_key: str) -> None:
     """Add new chunks to FAISS without rebuilding already indexed files."""
     if not chunks:
-        st.session_state.total_chunks = sum(
-            len(file_record["chunks"])
-            for file_record in st.session_state.indexed_files.values()
-        )
         return
 
     embeddings = get_embeddings(api_key)
@@ -225,14 +255,50 @@ def add_chunks_to_vector_store(chunks: list[Document], api_key: str) -> None:
     else:
         st.session_state.vector_store.add_documents(chunks)
 
-    st.session_state.total_chunks += len(chunks)
     st.session_state.chain = None
     st.session_state.chain_signature = None
+
+
+def show_indexing_error(file_name: str, error: Exception) -> None:
+    """Show an actionable message for a non-PDF failure during indexing."""
+    if isinstance(error, AuthenticationError):
+        st.error(
+            f"`{file_name}` could not be indexed because OpenAI rejected the API key. "
+            "Paste a valid API key and try again."
+        )
+    elif isinstance(error, RateLimitError):
+        st.error(
+            f"`{file_name}` could not be indexed because the OpenAI API quota or "
+            "rate limit was reached. Check the key's billing and limits, then try again."
+        )
+    elif isinstance(error, APIConnectionError):
+        st.error(
+            f"`{file_name}` could not be indexed because the app could not reach "
+            "OpenAI. Check your connection and try again."
+        )
+    elif isinstance(error, APIError):
+        st.error(
+            f"`{file_name}` could not be indexed because OpenAI returned an API error. "
+            "Please try again shortly."
+        )
+    else:
+        st.error(
+            f"`{file_name}` could not be added to the search index. "
+            "Please try again with a smaller text-based PDF."
+        )
 
 
 def process_uploaded_files(uploaded_files: list[Any], api_key: str) -> None:
     """Parse and index newly uploaded PDFs into the shared vector store."""
     for uploaded_file in uploaded_files:
+        file_size = getattr(uploaded_file, "size", None)
+        if file_size is not None and file_size > MAX_FILE_SIZE_BYTES:
+            st.error(
+                f"`{uploaded_file.name}` is larger than the {MAX_FILE_SIZE_MB} MB "
+                "per-file limit."
+            )
+            continue
+
         file_bytes = uploaded_file.getvalue()
         file_id = get_file_id(uploaded_file.name, file_bytes)
 
@@ -242,26 +308,51 @@ def process_uploaded_files(uploaded_files: list[Any], api_key: str) -> None:
         ):
             continue
 
+        if len(st.session_state.indexed_files) >= MAX_PDF_COUNT:
+            st.warning(f"You can index up to {MAX_PDF_COUNT} PDFs at a time.")
+            break
+
         try:
             page_documents, page_count = extract_pdf_pages(uploaded_file.name, file_bytes)
-            chunks = split_documents(page_documents) if page_documents else []
+        except Exception as exc:
+            st.error(
+                f"Could not read `{uploaded_file.name}`. The file may be corrupted, "
+                "encrypted, unsupported, or contain no extractable text."
+            )
+            continue
+
+        chunks = split_documents(page_documents) if page_documents else []
+        if not chunks:
             st.session_state.indexed_files[file_id] = {
                 "name": uploaded_file.name,
                 "page_count": page_count,
-                "chunks": chunks,
+                "chunks": [],
             }
-            add_chunks_to_vector_store(chunks, api_key)
-
-            if not chunks:
-                st.warning(
-                    f"`{uploaded_file.name}` was uploaded, but no readable text "
-                    "was found. Scanned PDFs may need OCR before indexing."
-                )
-        except Exception as exc:
-            st.error(
-                f"Could not process `{uploaded_file.name}`. The file may be "
-                f"corrupted, encrypted, or unsupported. Details: {exc}"
+            st.warning(
+                f"`{uploaded_file.name}` was uploaded, but no readable text was found. "
+                "Scanned PDFs may need OCR before indexing."
             )
+            continue
+
+        if st.session_state.total_chunks + len(chunks) > MAX_TOTAL_CHUNKS:
+            st.warning(
+                f"`{uploaded_file.name}` would exceed the {MAX_TOTAL_CHUNKS}-chunk "
+                "index limit. Remove a PDF or upload a smaller document."
+            )
+            continue
+
+        try:
+            add_chunks_to_vector_store(chunks, api_key)
+        except Exception as exc:
+            show_indexing_error(uploaded_file.name, exc)
+            continue
+
+        st.session_state.indexed_files[file_id] = {
+            "name": uploaded_file.name,
+            "page_count": page_count,
+            "chunks": chunks,
+        }
+        update_total_chunks()
 
 
 def has_indexable_chunks() -> bool:

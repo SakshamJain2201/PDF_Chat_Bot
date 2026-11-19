@@ -12,6 +12,8 @@ OpenAI `gpt-4o-mini` through a conversational retrieval chain.
 - Ask follow-up questions with chat history.
 - View retrieved source chunks below each assistant answer.
 - Remove indexed PDFs, clear chat history, or reset the app state.
+- Protect public deployments with a five-PDF, 25 MB-per-file, and 1,500-chunk limit.
+- Keep visitor API clients isolated to their Streamlit session.
 - Works locally with `.env` and on Streamlit Cloud with `st.secrets`.
 
 ## Local Setup
@@ -80,6 +82,7 @@ OpenAI `gpt-4o-mini` through a conversational retrieval chain.
 ## Notes
 
 - Scanned PDFs without embedded text may need OCR before the app can index them.
+- The app accepts up to five PDFs, each up to 25 MB, with a 1,500 total-chunk cap.
 - If the model cannot find an answer in the retrieved chunks, it is instructed to
   say: `I couldn't find that information in the uploaded documents.`
 - The sidebar API key field is only used when `st.secrets["OPENAI_API_KEY"]` and
